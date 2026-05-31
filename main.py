@@ -953,6 +953,7 @@ def render_chart(ticker, period="2y", interval="1d"):
     try:
         df = download(ticker, period, interval)
     except Exception as e:
+        plt.close("all")
         return None, str(e)
 
     close  = df["Close"]
@@ -1245,9 +1246,10 @@ def render_chart(ticker, period="2y", interval="1d"):
 
     buf = io.BytesIO()
     plt.savefig(buf, format="png", dpi=150, bbox_inches="tight", facecolor=STYLE["bg"])
-    plt.close(fig)
+    plt.close("all")  # libera memoria — crítico en GitHub Actions
     buf.seek(0)
     b64 = base64.b64encode(buf.read()).decode("utf-8")
+    buf.close()
     return b64, None
 
 
@@ -1538,7 +1540,8 @@ def main():
     # ── Graficador: generar PNG por ticker ─────────────────────
     print("Generando gráficos...")
     ok_tickers = [r["ticker"] for r in results]
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+    # max_workers=2 para evitar picos de RAM en GitHub Actions
+    with ThreadPoolExecutor(max_workers=2) as ex:
         def gen_chart(t):
             b64, err = render_chart(t)
             fname = t.replace("=", "").replace("-", "_")
