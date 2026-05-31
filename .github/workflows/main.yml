@@ -1,10 +1,11 @@
 name: Actualizar LCrack Dashboard
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main ]
   schedule:
-    - cron: '0 18 * * *' # Se ejecuta diariamente a las 18:00 UTC
+    - cron: '0 18 * * *'
 
 jobs:
   build:
