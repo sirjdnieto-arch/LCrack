@@ -1496,7 +1496,7 @@ async function loadChart() {{
   img.style.display = 'none';
   try {{
     // Usamos ruta relativa pura para asegurar compatibilidad en gh-pages
-    var resp = await fetch('./data/charts/' + ticker.replace('=','').replace('-','_') + '.b64');
+    var resp = await fetch('data/charts/' + ticker.replace('=','').replace('-','_') + '.b64');
     if (!resp.ok) throw new Error('No disponible');
     var b64 = await resp.text();
     img.src = 'data:image/png;base64,' + b64.trim();
