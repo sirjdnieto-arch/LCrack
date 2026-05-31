@@ -1271,7 +1271,7 @@ ORDEN_SEÑAL = {
 
 
 def build_html(rows):
-    rows_json = json.dumps(rows, ensure_ascii=False)
+    # Ya no necesitamos rows_json aquí porque cargaremos el JSON desde un archivo
     return f"""<!doctype html>
 <html lang="es">
 <head>
@@ -1279,12 +1279,13 @@ def build_html(rows):
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>LCrack Sovereign</title>
 <style>
+/* ... (tu CSS se mantiene igual) ... */
 :root{{
   --bg:#0d0f14;--panel:#13161e;--panel2:#1a1e28;--border:#1f2430;
   --text:#c8cad0;--muted:#555a6a;
   --bull:#26a65b;--bear:#e04040;--warn:#efb030;
 }}
-*{{box-sizing:border-box;margin:0;padding:0}}
+*{box-sizing:border-box;margin:0;padding:0}
 body{{font-family:monospace,monospace;background:var(--bg);color:var(--text);min-height:100vh}}
 .app{{max-width:1700px;margin:auto;padding:20px}}
 h1{{font-size:22px;font-weight:900;margin-bottom:4px}}
@@ -1330,13 +1331,12 @@ tr:hover td{{background:rgba(255,255,255,.03)}}
 <body>
 <div class="app">
   <h1>LCrack Sovereign</h1>
-  <div class="sub" id="subtitle">Cargando...</div>
+  <div class="sub" id="subtitle">Cargando datos...</div>
   <div class="tabs">
     <button class="tab-btn active" onclick="switchTab('dashboard',this)">📊 Dashboard</button>
     <button class="tab-btn" onclick="switchTab('graficador',this)">📈 Graficador</button>
   </div>
 
-  <!-- DASHBOARD -->
   <div id="tab-dashboard" class="tab-pane active">
     <div class="card">
       <div class="filters">
@@ -1361,13 +1361,10 @@ tr:hover td{{background:rgba(255,255,255,.03)}}
     </div>
   </div>
 
-  <!-- GRAFICADOR -->
   <div id="tab-graficador" class="tab-pane">
     <div class="card">
       <div class="g-search-wrap">
-        <input id="g-input" placeholder="AAPL"
-          onkeydown="if(event.key==='Enter')loadChart()"
-          oninput="filterChips()">
+        <input id="g-input" placeholder="AAPL" onkeydown="if(event.key==='Enter')loadChart()" oninput="filterChips()">
         <button class="btn" onclick="loadChart()">Analizar</button>
         <span style="color:var(--muted);font-size:11px">Tickers del universo escaneado</span>
       </div>
@@ -1379,8 +1376,20 @@ tr:hover td{{background:rgba(255,255,255,.03)}}
 </div>
 
 <script>
-var ROWS = {rows_json};
+// Cargamos los datos de forma asíncrona
+var ROWS = [];
 var ORDEN = {json.dumps(ORDEN_SEÑAL, ensure_ascii=False)};
+
+fetch('data.json')
+  .then(response => response.json())
+  .then(data => {{
+      ROWS = data;
+      init();
+  }})
+  .catch(err => {{
+      document.getElementById('subtitle').textContent = 'Error cargando datos';
+      console.error(err);
+  }});
 
 function switchTab(id, btn) {{
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
@@ -1486,7 +1495,8 @@ async function loadChart() {{
   loading.textContent = 'Cargando gráfico de ' + ticker + '...';
   img.style.display = 'none';
   try {{
-    var resp = await fetch('/LCrack/data/charts/' + ticker.replace('=','').replace('-','_') + '.b64');
+    // Usamos ruta relativa pura para asegurar compatibilidad en gh-pages
+    var resp = await fetch('./data/charts/' + ticker.replace('=','').replace('-','_') + '.b64');
     if (!resp.ok) throw new Error('No disponible');
     var b64 = await resp.text();
     img.src = 'data:image/png;base64,' + b64.trim();
@@ -1496,73 +1506,7 @@ async function loadChart() {{
     loading.textContent = '❌ ' + ticker + ': gráfico no disponible — ' + e.message;
   }}
 }}
-
-init();
 </script>
 </body>
 </html>
 """
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-    print("LCrack Sovereign — iniciando")
-    site_dir   = Path("site")
-    data_dir   = site_dir / "data"
-    charts_dir = data_dir / "charts"
-    site_dir.mkdir(exist_ok=True)
-    data_dir.mkdir(parents=True, exist_ok=True)
-    charts_dir.mkdir(parents=True, exist_ok=True)
-
-    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    # ── Dashboard: analizar todos los tickers en paralelo ──────
-    print(f"Analizando {len(TICKERS)} tickers...")
-    results = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(analyze_ticker, t): t for t in TICKERS}
-        for fut in as_completed(futures):
-            t = futures[fut]
-            try:
-                r = fut.result()
-                if r:
-                    r["generated_at"] = generated_at
-                    results.append(r)
-                    print(f"  ✓ {t:14s} {r['señal']}")
-            except Exception as e:
-                print(f"  ❌ {t}: {e}")
-
-    results.sort(key=lambda x: (ORDEN_SEÑAL.get(x.get("señal", ""), 9), x["ticker"]))
-
-    # ── Graficador: generar PNG por ticker ─────────────────────
-    print("Generando gráficos...")
-    ok_tickers = [r["ticker"] for r in results]
-    # max_workers=2 para evitar picos de RAM en GitHub Actions
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        def gen_chart(t):
-            b64, err = render_chart(t)
-            fname = t.replace("=", "").replace("-", "_")
-            if b64:
-                (charts_dir / f"{fname}.b64").write_text(b64, encoding="utf-8")
-                return True
-            else:
-                print(f"  ⚠ gráfico {t}: {err}")
-                return False
-
-        futures_c = {ex.submit(gen_chart, t): t for t in ok_tickers}
-        n_charts = sum(1 for fut in as_completed(futures_c) if fut.result())
-
-    print(f"  {n_charts}/{len(ok_tickers)} gráficos generados")
-
-    # ── Escribir site/ ─────────────────────────────────────────
-    (site_dir / "index.html").write_text(build_html(results), encoding="utf-8")
-    print(f"\n✅ Site generado en ./site/")
-    print(f"   Activos: {len(results)} · Gráficos: {n_charts}")
-    print(f"   Abre site/index.html en el navegador")
-
-
-if __name__ == "__main__":
-    main()
