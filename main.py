@@ -1486,7 +1486,7 @@ async function loadChart() {{
   loading.textContent = 'Cargando gráfico de ' + ticker + '...';
   img.style.display = 'none';
   try {{
-    var resp = await fetch('data/charts/' + ticker.replace('=','').replace('-','_') + '.b64');
+    var resp = await fetch('/LCrack/data/charts/' + ticker.replace('=','').replace('-','_') + '.b64');
     if (!resp.ok) throw new Error('No disponible');
     var b64 = await resp.text();
     img.src = 'data:image/png;base64,' + b64.trim();
