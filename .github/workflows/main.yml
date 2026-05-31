@@ -1,19 +1,17 @@
-# .github/workflows/deploy.yml
-
 name: Deploy LCrack Dashboard
 
-# ══════════════════════════════════════════════════════════════
-# FIX 1 — Concurrencia: cancela runs anteriores del mismo grupo
-# Evita que dos pushes simultáneos colisionen en gh-pages
-# ══════════════════════════════════════════════════════════════
 concurrency:
   group: gh-pages-deploy
   cancel-in-progress: true
 
 on:
   schedule:
-    - cron: '0 8 * * 1-5'   # lunes-viernes 08:00 UTC
+    - cron: '0 8 * * 1-5'
   workflow_dispatch:
+
+# ✅ FIX: permisos explícitos de escritura
+permissions:
+  contents: write
 
 jobs:
   build-and-deploy:
@@ -39,11 +37,6 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./site
-          # ══════════════════════════════════════════════════
-          # FIX 2 — force_orphan: reescribe gh-pages completo
-          # en vez de hacer merge/fast-forward — elimina el
-          # conflicto de historia divergente para siempre
-          # ══════════════════════════════════════════════════
           force_orphan: true
           user_name: 'github-actions[bot]'
           user_email: 'github-actions[bot]@users.noreply.github.com'
