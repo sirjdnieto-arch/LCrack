@@ -1380,7 +1380,7 @@ tr:hover td{{background:rgba(255,255,255,.03)}}
 var ROWS = [];
 var ORDEN = {json.dumps(ORDEN_SEÑAL, ensure_ascii=False)};
 
-fetch('data.json')
+fetch('./data.json')
   .then(response => response.json())
   .then(data => {{
       ROWS = data;
