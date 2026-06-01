@@ -1270,8 +1270,8 @@ ORDEN_SEÑAL = {
 }
 
 
-def build_html(rows):
-    rows_json = json.dumps(rows, ensure_ascii=True)
+def build_html():
+    orden_js = json.dumps(ORDEN_SEÑAL, ensure_ascii=True)
     return f"""<!doctype html>
 <html lang="es">
 <head>
@@ -1379,8 +1379,16 @@ tr:hover td{{background:rgba(255,255,255,.03)}}
 </div>
 
 <script>
-var ROWS = {rows_json};
-var ORDEN = {json.dumps(ORDEN_SEÑAL, ensure_ascii=True)};
+var ROWS = [];
+var ORDEN = {orden_js};
+
+fetch('./data.json')
+  .then(r => r.json())
+  .then(data => {{ ROWS = data; init(); }})
+  .catch(err => {{
+    document.getElementById('subtitle').textContent = 'Error cargando datos: ' + err;
+    console.error(err);
+  }});
 
 function switchTab(id, btn) {{
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
@@ -1486,7 +1494,7 @@ async function loadChart() {{
   loading.textContent = 'Cargando gráfico de ' + ticker + '...';
   img.style.display = 'none';
   try {{
-    var resp = await fetch('data/charts/' + ticker.replace('=','').replace('-','_') + '.b64');
+    var resp = await fetch('data/charts/' + ticker.replace(/=/g,'').replace(/-/g,'_') + '.b64');
     if (!resp.ok) throw new Error('No disponible');
     var b64 = await resp.text();
     img.src = 'data:image/png;base64,' + b64.trim();
@@ -1557,11 +1565,21 @@ def main():
 
     print(f"  {n_charts}/{len(ok_tickers)} gráficos generados")
 
-    # ── Escribir site/ ─────────────────────────────────────────
-    (site_dir / "index.html").write_text(build_html(results), encoding="utf-8")
-    print(f"\n✅ Site generado en ./site/")
-    print(f"   Activos: {len(results)} · Gráficos: {n_charts}")
-    print(f"   Abre site/index.html en el navegador")
+    # ── Escribir data.json ─────────────────────────────────────
+    data_json_path = site_dir / "data.json"
+    data_json_path.write_text(
+        json.dumps(results, ensure_ascii=True, indent=2), encoding="utf-8"
+    )
+    print(f"✅ data.json → {data_json_path} ({len(results)} tickers)")
+
+    # ── Escribir index.html ────────────────────────────────────
+    html_path = site_dir / "index.html"
+    html_path.write_text(build_html(), encoding="utf-8")
+    print(f"✅ index.html → {html_path}")
+    print(f"\n🏁 Estructura generada:")
+    print(f"   site/index.html")
+    print(f"   site/data.json           ({len(results)} tickers)")
+    print(f"   site/data/charts/*.b64   ({len(list(charts_dir.glob('*.b64')))} gráficos)")
 
 
 if __name__ == "__main__":
