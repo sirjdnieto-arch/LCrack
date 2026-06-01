@@ -8,25 +8,45 @@ Uso:
     python main.py
 """
 
+# ============================================================
+# FIX 1 — MPLBACKEND debe fijarse como variable de entorno
+#          ANTES de cualquier import de matplotlib.
+#          Esto es más robusto que matplotlib.use() en GitHub Actions
+#          porque evita la detección automática de backends GUI
+#          que provoca el error _get_renderer.Done.
+# ============================================================
+import os
+os.environ["MPLBACKEND"] = "Agg"
+
 import json
 import warnings
 import base64
 import io
+import threading          # FIX 2 — lock para operaciones matplotlib en hilos
 from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
+
+# FIX 3 — matplotlib.use() se llama DESPUÉS de fijar MPLBACKEND
+#          para doble seguridad, pero el orden de imports ya es correcto
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+
 import yfinance as yf
 from ta.trend import MACD, EMAIndicator, ADXIndicator
 from ta.momentum import RSIIndicator
 
 warnings.filterwarnings("ignore")
+
+# FIX 4 — Lock global: matplotlib no es thread-safe en la creación/guardado
+#          de figuras. Dos hilos generando PNGs simultáneamente sin lock
+#          puede corromper el renderer interno y provocar Done no capturado.
+_MPL_LOCK = threading.Lock()
 
 # ============================================================
 # TICKERS — exactamente los del notebook (Cell 0)
@@ -83,6 +103,7 @@ STYLE = {
     "zero":      "#2a2e3a",
 }
 
+# FIX 5 — rcParams se aplica UNA sola vez en el módulo, no dentro de hilos
 plt.rcParams.update({
     "figure.facecolor":  STYLE["bg"],
     "axes.facecolor":    STYLE["panel"],
@@ -152,7 +173,6 @@ def mcginley_dynamic(close, period=25):
                                   (k * period * (close.iloc[i] / prev) ** 4))
     return md
 
-# alias usado en Cell 1
 mcginley = mcginley_dynamic
 
 
@@ -188,7 +208,7 @@ def mfi_blai5(high, low, close, volume, length=14):
     rs   = up / dn.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
-calc_mfi_blai5 = mfi_blai5  # alias Cell 0
+calc_mfi_blai5 = mfi_blai5
 
 
 def stoch_blai5(src, high, low, length=21, smooth=3):
@@ -197,7 +217,7 @@ def stoch_blai5(src, high, low, length=21, smooth=3):
     k  = 100 * (src - ll) / (hh - ll)
     return k.rolling(smooth).mean()
 
-calc_stoch = stoch_blai5  # alias Cell 0
+calc_stoch = stoch_blai5
 
 
 def koncorde(df, m=15):
@@ -237,7 +257,6 @@ def koncorde(df, m=15):
     out["media"]  = media
     return out
 
-# alias usado en Cell 0
 compute_blai5_koncorde = koncorde
 
 
@@ -310,7 +329,7 @@ def awesome_osc(high, low):
     med = (high + low) / 2.0
     return med.rolling(5).mean() - med.rolling(34).mean()
 
-calcular_ao = awesome_osc  # alias Cell 0
+calcular_ao = awesome_osc
 
 
 def clasificar_bitman(df):
@@ -461,7 +480,6 @@ def detectar_divergencia(df, oscilador=None, lookback=50, order=2, max_gap=15):
     result["divergencia"]      = out_flag
     return result
 
-# alias usado en Cell 0
 detectar_divergencia_simple = detectar_divergencia
 
 
@@ -670,8 +688,7 @@ def semaforo(data, velas):
 
 
 # ============================================================
-# DASHBOARD — Cell 0: get_sovereign_dashboard (adaptado para
-#   devolver dict en vez de sólo imprimir)
+# DASHBOARD — Cell 0
 # ============================================================
 
 def analyze_ticker(t):
@@ -864,7 +881,7 @@ def analyze_ticker(t):
 
 
 # ============================================================
-# GRAFICADOR — Cell 1: plot_dashboard → devuelve PNG en base64
+# GRAFICADOR — Cell 1
 # ============================================================
 
 def build_signals_graficador(df, mcg25, ema200, konc_df, pvi_s, pvi_ema,
@@ -947,310 +964,341 @@ def panel_style(ax, ylabel="", yticks=5, zero_line=False):
 
 def render_chart(ticker, period="2y", interval="1d"):
     """
-    Genera el gráfico multipanel exactamente como Cell 1.
-    Devuelve imagen PNG en base64 o None si falla.
+    Genera el gráfico multipanel.
+    Devuelve (b64_string, None) o (None, error_str).
+
+    FIX CLAVE: todo el bloque matplotlib está protegido por _MPL_LOCK
+    para evitar condiciones de carrera entre hilos que corrompían el
+    renderer interno y producían el error _get_renderer.Done.
     """
+    # ── 1. Descarga de datos (fuera del lock — es I/O puro) ────
     try:
         df = download(ticker, period, interval)
     except Exception as e:
-        plt.close("all")
         return None, str(e)
 
-    close  = df["Close"]
-    high   = df["High"]
-    low    = df["Low"]
-    volume = df["Volume"]
+    # ── 2. Cálculo de indicadores (fuera del lock — sólo numpy/pandas) ──
+    try:
+        close  = df["Close"]
+        high   = df["High"]
+        low    = df["Low"]
+        volume = df["Volume"]
 
-    mcg25   = mcginley(close, 25)
-    ema200  = EMAIndicator(close=close, window=200).ema_indicator()
-    adx_ind = ADXIndicator(high=high, low=low, close=close, window=14)
-    adx_s   = adx_ind.adx()
-    pdi_s   = adx_ind.adx_pos()
-    ndi_s   = adx_ind.adx_neg()
-    ao_s    = awesome_osc(high, low)
-    bitman  = clasificar_bitman(df)
-    div_df  = detectar_divergencia(df)
-    _, bbwp_s = calculate_bbwp(close, bb_len=13, lookback=252)
-    konc    = koncorde(df, m=15)
-    pvi_s   = pvi_calc(close, volume)
-    pvi_ema = pvi_s.ewm(span=25, adjust=False).mean()
-    macd_obj  = MACD(close=close, window_fast=12, window_slow=26, window_sign=9)
-    macd_line = macd_obj.macd()
-    macd_sig  = macd_obj.macd_signal()
-    macd_hist = macd_obj.macd_diff()
-    rsi_s   = RSIIndicator(close=close, window=14).rsi()
+        mcg25   = mcginley(close, 25)
+        ema200  = EMAIndicator(close=close, window=200).ema_indicator()
+        adx_ind = ADXIndicator(high=high, low=low, close=close, window=14)
+        adx_s   = adx_ind.adx()
+        pdi_s   = adx_ind.adx_pos()
+        ndi_s   = adx_ind.adx_neg()
+        ao_s    = awesome_osc(high, low)
+        bitman  = clasificar_bitman(df)
+        div_df  = detectar_divergencia(df)
+        _, bbwp_s = calculate_bbwp(close, bb_len=13, lookback=252)
+        konc    = koncorde(df, m=15)
+        pvi_s   = pvi_calc(close, volume)
+        pvi_ema = pvi_s.ewm(span=25, adjust=False).mean()
+        macd_obj  = MACD(close=close, window_fast=12, window_slow=26, window_sign=9)
+        macd_line = macd_obj.macd()
+        macd_sig  = macd_obj.macd_signal()
+        macd_hist = macd_obj.macd_diff()
+        rsi_s   = RSIIndicator(close=close, window=14).rsi()
 
-    sigs = build_signals_graficador(df, mcg25, ema200, konc, pvi_s, pvi_ema,
-                                    macd_line, macd_hist, rsi_s, adx_s, bitman, div_df)
-    pct, score_label, bull_n, total_n = score_signals(sigs)
+        sigs = build_signals_graficador(df, mcg25, ema200, konc, pvi_s, pvi_ema,
+                                        macd_line, macd_hist, rsi_s, adx_s, bitman, div_df)
+        pct, score_label, bull_n, total_n = score_signals(sigs)
+    except Exception as e:
+        return None, f"Cálculo indicadores: {e}"
 
-    fig = plt.figure(figsize=(16, 20), facecolor=STYLE["bg"])
-    fig.subplots_adjust(left=0.07, right=0.97, top=0.95, bottom=0.03, hspace=0.06)
-    heights = [5, 2, 2.2, 1.4, 1.6, 1.8, 1.6]
-    gs      = gridspec.GridSpec(7, 1, figure=fig, height_ratios=heights, hspace=0.06)
-    axes    = [fig.add_subplot(gs[i]) for i in range(7)]
-    for i in range(6):
-        axes[i].tick_params(labelbottom=False)
+    # ── 3. Renderizado matplotlib — PROTEGIDO CON LOCK ─────────
+    with _MPL_LOCK:
+        fig = None
+        try:
+            n_max   = min(252, len(df))
+            df_plot = df.iloc[-n_max:]
+            idx     = df_plot.index
+            xs      = np.arange(len(idx))
 
-    last_price = close.iloc[-1]
-    prev_price = close.iloc[-2]
-    chg        = last_price - prev_price
-    pct_chg    = chg / prev_price * 100
-    chg_color  = STYLE["bull"] if chg >= 0 else STYLE["bear"]
-    sign       = "+" if chg >= 0 else ""
+            def sv(s):
+                return align_series(s, idx)
 
-    fig.text(0.07, 0.965, ticker, fontsize=18, fontweight="bold", color=STYLE["text"], va="bottom")
-    fig.text(0.19, 0.965, f"{last_price:.2f}", fontsize=16, fontweight="bold", color=STYLE["text"], va="bottom")
-    fig.text(0.30, 0.965, f"{sign}{chg:.2f}  ({sign}{pct_chg:.2f}%)", fontsize=12, color=chg_color, va="bottom")
-    score_color = STYLE["bull"] if pct >= 60 else (STYLE["bear"] if pct < 40 else STYLE["mcg"])
-    fig.text(0.97, 0.965, f"{score_label}  ·  {bull_n}/{total_n}  ({pct}%)",
-             fontsize=11, color=score_color, ha="right", va="bottom", style="italic")
+            last_price = close.iloc[-1]
+            prev_price = close.iloc[-2]
+            chg        = last_price - prev_price
+            pct_chg    = chg / prev_price * 100
+            chg_color  = STYLE["bull"] if chg >= 0 else STYLE["bear"]
+            sign       = "+" if chg >= 0 else ""
 
-    n_max   = min(252, len(df))
-    df_plot = df.iloc[-n_max:]
-    idx     = df_plot.index
-    xs      = np.arange(len(idx))
+            score_color = STYLE["bull"] if pct >= 60 else (STYLE["bear"] if pct < 40 else STYLE["mcg"])
 
-    def sv(s):
-        return align_series(s, idx)
+            fig = plt.figure(figsize=(16, 20), facecolor=STYLE["bg"])
+            fig.subplots_adjust(left=0.07, right=0.97, top=0.95, bottom=0.03, hspace=0.06)
+            heights = [5, 2, 2.2, 1.4, 1.6, 1.8, 1.6]
+            gs      = gridspec.GridSpec(7, 1, figure=fig, height_ratios=heights, hspace=0.06)
+            axes    = [fig.add_subplot(gs[i]) for i in range(7)]
+            for i in range(6):
+                axes[i].tick_params(labelbottom=False)
 
-    # Panel 0 — Velas + McGinley25 + EMA200
-    ax0 = axes[0]
-    w   = 0.4
-    for i, (_, row) in enumerate(df_plot.iterrows()):
-        col = STYLE["bull"] if row["Close"] >= row["Open"] else STYLE["bear"]
-        ax0.plot([i, i], [row["Low"], row["High"]], color=col, lw=0.8, zorder=2)
-        ax0.add_patch(plt.Rectangle(
-            (i - w, min(row["Open"], row["Close"])),
-            2 * w, max(abs(row["Close"] - row["Open"]), 0.001),
-            color=col, zorder=3))
-    ax0.plot(xs, sv(mcg25),  color=STYLE["mcg"],   lw=1.4, label="MCG 25",  zorder=4)
-    ax0.plot(xs, sv(ema200), color=STYLE["ema200"], lw=1.4, label="EMA 200", zorder=4)
-    ax0.set_xlim(-1, len(idx))
-    ax0.legend(loc="upper left", fontsize=8, frameon=False,
-               labelcolor=[STYLE["mcg"], STYLE["ema200"]])
-    panel_style(ax0, ylabel="Precio")
-    ax0.set_title("Velas  ·  McGinley 25  ·  EMA 200",
-                  fontsize=9, color=STYLE["muted"], loc="right", pad=4)
-    format_xaxis(ax0, idx)
-    ax0.tick_params(labelbottom=True)
+            fig.text(0.07, 0.965, ticker, fontsize=18, fontweight="bold",
+                     color=STYLE["text"], va="bottom")
+            fig.text(0.19, 0.965, f"{last_price:.2f}", fontsize=16,
+                     fontweight="bold", color=STYLE["text"], va="bottom")
+            fig.text(0.30, 0.965, f"{sign}{chg:.2f}  ({sign}{pct_chg:.2f}%)",
+                     fontsize=12, color=chg_color, va="bottom")
+            fig.text(0.97, 0.965, f"{score_label}  ·  {bull_n}/{total_n}  ({pct}%)",
+                     fontsize=11, color=score_color, ha="right", va="bottom", style="italic")
 
-    # Panel 1 — ADX + AO
-    ax1  = axes[1]
-    ax1r = ax1.twinx()
-    ao_vals   = sv(ao_s)
-    ao_prev   = np.roll(ao_vals, 1); ao_prev[0] = ao_vals[0]
-    ao_colors = [STYLE["ao_up"] if ao_vals[i] >= ao_prev[i] else STYLE["ao_dn"]
-                 for i in range(len(ao_vals))]
-    ax1r.bar(xs, ao_vals, color=ao_colors, alpha=0.7, width=0.8, zorder=2)
-    ax1r.axhline(0, color=STYLE["zero"], lw=0.7)
-    ax1r.tick_params(labelsize=7, colors=STYLE["muted"])
-    ax1r.set_ylabel("AO", fontsize=7, color=STYLE["muted"])
-    ax1r.spines["right"].set_edgecolor(STYLE["border"])
-    ax1.plot(xs, sv(adx_s), color=STYLE["adx"], lw=1.4, label="ADX", zorder=3)
-    ax1.plot(xs, sv(pdi_s), color=STYLE["pdi"], lw=0.9, ls="--", label="+DI", zorder=3)
-    ax1.plot(xs, sv(ndi_s), color=STYLE["ndi"], lw=0.9, ls="--", label="-DI", zorder=3)
-    ax1.axhline(25, color=STYLE["muted"], lw=0.6, ls=":")
-    ax1.legend(loc="upper left", fontsize=7, frameon=False,
-               labelcolor=[STYLE["adx"], STYLE["pdi"], STYLE["ndi"]])
-    panel_style(ax1, ylabel="ADX")
-    ax1.set_title("ADX  ·  +DI / -DI  ·  Awesome Oscillator",
-                  fontsize=9, color=STYLE["muted"], loc="right", pad=4)
+            # Panel 0 — Velas + McGinley25 + EMA200
+            ax0 = axes[0]
+            w   = 0.4
+            for i, (_, row) in enumerate(df_plot.iterrows()):
+                col = STYLE["bull"] if row["Close"] >= row["Open"] else STYLE["bear"]
+                ax0.plot([i, i], [row["Low"], row["High"]], color=col, lw=0.8, zorder=2)
+                ax0.add_patch(plt.Rectangle(
+                    (i - w, min(row["Open"], row["Close"])),
+                    2 * w, max(abs(row["Close"] - row["Open"]), 0.001),
+                    color=col, zorder=3))
+            ax0.plot(xs, sv(mcg25),  color=STYLE["mcg"],   lw=1.4, label="MCG 25",  zorder=4)
+            ax0.plot(xs, sv(ema200), color=STYLE["ema200"], lw=1.4, label="EMA 200", zorder=4)
+            ax0.set_xlim(-1, len(idx))
+            ax0.legend(loc="upper left", fontsize=8, frameon=False,
+                       labelcolor=[STYLE["mcg"], STYLE["ema200"]])
+            panel_style(ax0, ylabel="Precio")
+            ax0.set_title("Velas  ·  McGinley 25  ·  EMA 200",
+                          fontsize=9, color=STYLE["muted"], loc="right", pad=4)
+            format_xaxis(ax0, idx)
+            ax0.tick_params(labelbottom=True)
 
-    # Panel 2 — Blai5 Koncorde
-    ax2 = axes[2]
-    ax2.fill_between(xs, sv(konc["verde"]),  alpha=0.45, color=STYLE["verde"],  label="Verde",  zorder=2)
-    ax2.fill_between(xs, sv(konc["marron"]), alpha=0.35, color=STYLE["marron"], label="Marrón", zorder=2)
-    ax2.fill_between(xs, sv(konc["azul"]),   alpha=0.35, color=STYLE["azul"],   label="Azul",   zorder=2)
-    ax2.plot(xs, sv(konc["verde"]),  color=STYLE["verde"],   lw=1.0, zorder=3)
-    ax2.plot(xs, sv(konc["marron"]), color=STYLE["marron"],  lw=1.0, zorder=3)
-    ax2.plot(xs, sv(konc["azul"]),   color=STYLE["azul"],    lw=1.0, zorder=3)
-    ax2.plot(xs, sv(konc["media"]),  color=STYLE["media_k"], lw=1.6, label="Media", zorder=4)
-    ax2.axhline(0, color=STYLE["zero"], lw=0.7)
-    ax2.legend(loc="upper left", fontsize=7, frameon=False,
-               labelcolor=[STYLE["verde"], STYLE["marron"], STYLE["azul"], STYLE["media_k"]])
-    panel_style(ax2, ylabel="Koncorde")
-    ax2.set_title("Blai5 Koncorde  ·  Verde / Marrón / Azul / Media",
-                  fontsize=9, color=STYLE["muted"], loc="right", pad=4)
+            # Panel 1 — ADX + AO
+            ax1  = axes[1]
+            ax1r = ax1.twinx()
+            ao_vals   = sv(ao_s)
+            ao_prev   = np.roll(ao_vals, 1); ao_prev[0] = ao_vals[0]
+            ao_colors = [STYLE["ao_up"] if ao_vals[i] >= ao_prev[i] else STYLE["ao_dn"]
+                         for i in range(len(ao_vals))]
+            ax1r.bar(xs, ao_vals, color=ao_colors, alpha=0.7, width=0.8, zorder=2)
+            ax1r.axhline(0, color=STYLE["zero"], lw=0.7)
+            ax1r.tick_params(labelsize=7, colors=STYLE["muted"])
+            ax1r.set_ylabel("AO", fontsize=7, color=STYLE["muted"])
+            ax1r.spines["right"].set_edgecolor(STYLE["border"])
+            ax1.plot(xs, sv(adx_s), color=STYLE["adx"], lw=1.4, label="ADX", zorder=3)
+            ax1.plot(xs, sv(pdi_s), color=STYLE["pdi"], lw=0.9, ls="--", label="+DI", zorder=3)
+            ax1.plot(xs, sv(ndi_s), color=STYLE["ndi"], lw=0.9, ls="--", label="-DI", zorder=3)
+            ax1.axhline(25, color=STYLE["muted"], lw=0.6, ls=":")
+            ax1.legend(loc="upper left", fontsize=7, frameon=False,
+                       labelcolor=[STYLE["adx"], STYLE["pdi"], STYLE["ndi"]])
+            panel_style(ax1, ylabel="ADX")
+            ax1.set_title("ADX  ·  +DI / -DI  ·  Awesome Oscillator",
+                          fontsize=9, color=STYLE["muted"], loc="right", pad=4)
 
-    # Panel 3 — BBWP 13/252
-    ax3    = axes[3]
-    bbwp_v = sv(bbwp_s)
-    ax3.fill_between(xs, bbwp_v, 20,
-                     where=(~np.isnan(bbwp_v)) & (bbwp_v < 20),
-                     alpha=0.20, color=STYLE["azul"], zorder=1)
-    ax3.fill_between(xs, bbwp_v, 80,
-                     where=(~np.isnan(bbwp_v)) & (bbwp_v > 80),
-                     alpha=0.20, color=STYLE["bear"], zorder=1)
-    bbwp_arr = bbwp_v.copy()
-    for i in range(1, len(xs)):
-        if np.isnan(bbwp_arr[i]) or np.isnan(bbwp_arr[i-1]):
-            continue
-        mid_val = (bbwp_arr[i] + bbwp_arr[i-1]) / 2
-        lc = STYLE["azul"] if mid_val < 20 else (STYLE["bear"] if mid_val > 80 else STYLE["muted"])
-        ax3.plot([xs[i-1], xs[i]], [bbwp_arr[i-1], bbwp_arr[i]], color=lc, lw=1.5, zorder=3)
-    ax3.axhline(80, color=STYLE["bear"],  lw=0.7, ls="--", alpha=0.6)
-    ax3.axhline(20, color=STYLE["azul"],  lw=0.7, ls="--", alpha=0.6)
-    ax3.axhline(50, color=STYLE["muted"], lw=0.5, ls=":",  alpha=0.4)
-    ax3.set_ylim(-2, 102)
-    ax3.yaxis.set_ticks([0, 20, 50, 80, 100])
-    panel_style(ax3, ylabel="BBWP")
-    ax3.set_title("BBWP 13/252  ·  🟢 compresión < 20  ·  🔴 expansión > 80",
-                  fontsize=9, color=STYLE["muted"], loc="right", pad=4)
+            # Panel 2 — Blai5 Koncorde
+            ax2 = axes[2]
+            ax2.fill_between(xs, sv(konc["verde"]),  alpha=0.45, color=STYLE["verde"],  label="Verde",  zorder=2)
+            ax2.fill_between(xs, sv(konc["marron"]), alpha=0.35, color=STYLE["marron"], label="Marrón", zorder=2)
+            ax2.fill_between(xs, sv(konc["azul"]),   alpha=0.35, color=STYLE["azul"],   label="Azul",   zorder=2)
+            ax2.plot(xs, sv(konc["verde"]),  color=STYLE["verde"],   lw=1.0, zorder=3)
+            ax2.plot(xs, sv(konc["marron"]), color=STYLE["marron"],  lw=1.0, zorder=3)
+            ax2.plot(xs, sv(konc["azul"]),   color=STYLE["azul"],    lw=1.0, zorder=3)
+            ax2.plot(xs, sv(konc["media"]),  color=STYLE["media_k"], lw=1.6, label="Media", zorder=4)
+            ax2.axhline(0, color=STYLE["zero"], lw=0.7)
+            ax2.legend(loc="upper left", fontsize=7, frameon=False,
+                       labelcolor=[STYLE["verde"], STYLE["marron"], STYLE["azul"], STYLE["media_k"]])
+            panel_style(ax2, ylabel="Koncorde")
+            ax2.set_title("Blai5 Koncorde  ·  Verde / Marrón / Azul / Media",
+                          fontsize=9, color=STYLE["muted"], loc="right", pad=4)
 
-    # Panel 4 — PVI + EMA 25
-    ax4   = axes[4]
-    pvi_v = sv(pvi_s)
-    pvi_e = sv(pvi_ema)
-    ax4.fill_between(xs, pvi_v, pvi_e, where=(pvi_v >= pvi_e), alpha=0.18, color=STYLE["bull"])
-    ax4.fill_between(xs, pvi_v, pvi_e, where=(pvi_v <  pvi_e), alpha=0.18, color=STYLE["bear"])
-    ax4.plot(xs, pvi_v, color=STYLE["pvi"],     lw=1.4, label="PVI")
-    ax4.plot(xs, pvi_e, color=STYLE["pvi_ema"], lw=1.4, ls="--", label="EMA 25")
-    ax4.legend(loc="upper left", fontsize=7, frameon=False,
-               labelcolor=[STYLE["pvi"], STYLE["pvi_ema"]])
-    panel_style(ax4, ylabel="PVI")
-    ax4.set_title("PVI  ·  EMA 25", fontsize=9, color=STYLE["muted"], loc="right", pad=4)
+            # Panel 3 — BBWP 13/252
+            ax3    = axes[3]
+            bbwp_v = sv(bbwp_s)
+            ax3.fill_between(xs, bbwp_v, 20,
+                             where=(~np.isnan(bbwp_v)) & (bbwp_v < 20),
+                             alpha=0.20, color=STYLE["azul"], zorder=1)
+            ax3.fill_between(xs, bbwp_v, 80,
+                             where=(~np.isnan(bbwp_v)) & (bbwp_v > 80),
+                             alpha=0.20, color=STYLE["bear"], zorder=1)
+            bbwp_arr = bbwp_v.copy()
+            for i in range(1, len(xs)):
+                if np.isnan(bbwp_arr[i]) or np.isnan(bbwp_arr[i-1]):
+                    continue
+                mid_val = (bbwp_arr[i] + bbwp_arr[i-1]) / 2
+                lc = STYLE["azul"] if mid_val < 20 else (STYLE["bear"] if mid_val > 80 else STYLE["muted"])
+                ax3.plot([xs[i-1], xs[i]], [bbwp_arr[i-1], bbwp_arr[i]], color=lc, lw=1.5, zorder=3)
+            ax3.axhline(80, color=STYLE["bear"],  lw=0.7, ls="--", alpha=0.6)
+            ax3.axhline(20, color=STYLE["azul"],  lw=0.7, ls="--", alpha=0.6)
+            ax3.axhline(50, color=STYLE["muted"], lw=0.5, ls=":",  alpha=0.4)
+            ax3.set_ylim(-2, 102)
+            ax3.yaxis.set_ticks([0, 20, 50, 80, 100])
+            panel_style(ax3, ylabel="BBWP")
+            ax3.set_title("BBWP 13/252  ·  🟢 compresión < 20  ·  🔴 expansión > 80",
+                          fontsize=9, color=STYLE["muted"], loc="right", pad=4)
 
-    # Panel 5 — MACD
-    ax5       = axes[5]
-    hist_v    = sv(macd_hist)
-    hist_prev = np.roll(hist_v, 1); hist_prev[0] = hist_v[0]
-    bar_colors = []
-    for i in range(len(hist_v)):
-        v, p = hist_v[i], hist_prev[i]
-        if np.isnan(v):
-            bar_colors.append(STYLE["muted"]); continue
-        if v >= 0:
-            bar_colors.append(STYLE["bull"] if v >= p else STYLE["bull_fade"])
-        else:
-            bar_colors.append(STYLE["bear"] if v <= p else STYLE["bear_fade"])
-    ax5.bar(xs, hist_v, color=bar_colors, width=0.8, alpha=0.9, zorder=2)
-    ax5.plot(xs, sv(macd_line), color=STYLE["macd_line"], lw=1.3, label="MACD",  zorder=3)
-    ax5.plot(xs, sv(macd_sig),  color=STYLE["macd_sig"],  lw=1.3, ls="--", label="Señal", zorder=3)
-    ax5.axhline(0, color=STYLE["zero"], lw=0.7)
-    ax5.legend(loc="upper left", fontsize=7, frameon=False,
-               labelcolor=[STYLE["macd_line"], STYLE["macd_sig"]])
-    panel_style(ax5, ylabel="MACD")
-    ax5.set_title("MACD  12 / 26 / 9", fontsize=9, color=STYLE["muted"], loc="right", pad=4)
+            # Panel 4 — PVI + EMA 25
+            ax4   = axes[4]
+            pvi_v = sv(pvi_s)
+            pvi_e = sv(pvi_ema)
+            ax4.fill_between(xs, pvi_v, pvi_e, where=(pvi_v >= pvi_e), alpha=0.18, color=STYLE["bull"])
+            ax4.fill_between(xs, pvi_v, pvi_e, where=(pvi_v <  pvi_e), alpha=0.18, color=STYLE["bear"])
+            ax4.plot(xs, pvi_v, color=STYLE["pvi"],     lw=1.4, label="PVI")
+            ax4.plot(xs, pvi_e, color=STYLE["pvi_ema"], lw=1.4, ls="--", label="EMA 25")
+            ax4.legend(loc="upper left", fontsize=7, frameon=False,
+                       labelcolor=[STYLE["pvi"], STYLE["pvi_ema"]])
+            panel_style(ax4, ylabel="PVI")
+            ax4.set_title("PVI  ·  EMA 25", fontsize=9, color=STYLE["muted"], loc="right", pad=4)
 
-    # Panel 6 — RSI + divergencias
-    ax6   = axes[6]
-    rsi_v = sv(rsi_s)
-    ax6.fill_between(xs, rsi_v, 70, where=(rsi_v > 70), alpha=0.25, color=STYLE["bull"])
-    ax6.fill_between(xs, rsi_v, 30, where=(rsi_v < 30), alpha=0.25, color=STYLE["bear"])
-    ax6.plot(xs, rsi_v, color=STYLE["rsi"], lw=1.4)
-    for level, col, ls in [(70, STYLE["bear"], "--"), (50, STYLE["muted"], ":"), (30, STYLE["bull"], "--")]:
-        ax6.axhline(level, color=col, lw=0.7, ls=ls)
-    if div_df is not None:
-        div_tipos = align_series(div_df["divergencia_tipo"], idx)
-        div_rsi_v = align_series(RSIIndicator(close=close, window=14).rsi(), idx)
-        for xi_d, (dt, rv) in enumerate(zip(div_tipos, div_rsi_v)):
-            if dt == "alcista":
-                ax6.annotate("▲", xy=(xi_d, rv), fontsize=8, color=STYLE["bull"],
-                             ha="center", va="top", xytext=(0, -8), textcoords="offset points")
-            elif dt == "bajista":
-                ax6.annotate("▼", xy=(xi_d, rv), fontsize=8, color=STYLE["bear"],
-                             ha="center", va="bottom", xytext=(0, 8), textcoords="offset points")
-    ax6.set_ylim(0, 100)
-    ax6.yaxis.set_ticks([30, 50, 70])
-    panel_style(ax6, ylabel="RSI", yticks=3)
-    format_xaxis(ax6, idx)
-    ax6.tick_params(labelbottom=True)
-    ax6.set_title("RSI  14  ·  ▲ div alcista  ▼ div bajista",
-                  fontsize=9, color=STYLE["muted"], loc="right", pad=4)
+            # Panel 5 — MACD
+            ax5       = axes[5]
+            hist_v    = sv(macd_hist)
+            hist_prev = np.roll(hist_v, 1); hist_prev[0] = hist_v[0]
+            bar_colors = []
+            for i in range(len(hist_v)):
+                v, p = hist_v[i], hist_prev[i]
+                if np.isnan(v):
+                    bar_colors.append(STYLE["muted"]); continue
+                if v >= 0:
+                    bar_colors.append(STYLE["bull"] if v >= p else STYLE["bull_fade"])
+                else:
+                    bar_colors.append(STYLE["bear"] if v <= p else STYLE["bear_fade"])
+            ax5.bar(xs, hist_v, color=bar_colors, width=0.8, alpha=0.9, zorder=2)
+            ax5.plot(xs, sv(macd_line), color=STYLE["macd_line"], lw=1.3, label="MACD",  zorder=3)
+            ax5.plot(xs, sv(macd_sig),  color=STYLE["macd_sig"],  lw=1.3, ls="--", label="Señal", zorder=3)
+            ax5.axhline(0, color=STYLE["zero"], lw=0.7)
+            ax5.legend(loc="upper left", fontsize=7, frameon=False,
+                       labelcolor=[STYLE["macd_line"], STYLE["macd_sig"]])
+            panel_style(ax5, ylabel="MACD")
+            ax5.set_title("MACD  12 / 26 / 9", fontsize=9, color=STYLE["muted"], loc="right", pad=4)
 
-    for ax in axes:
-        ax.set_xlim(-1, len(idx))
+            # Panel 6 — RSI + divergencias
+            ax6   = axes[6]
+            rsi_v = sv(rsi_s)
+            ax6.fill_between(xs, rsi_v, 70, where=(rsi_v > 70), alpha=0.25, color=STYLE["bull"])
+            ax6.fill_between(xs, rsi_v, 30, where=(rsi_v < 30), alpha=0.25, color=STYLE["bear"])
+            ax6.plot(xs, rsi_v, color=STYLE["rsi"], lw=1.4)
+            for level, col, ls in [(70, STYLE["bear"], "--"), (50, STYLE["muted"], ":"), (30, STYLE["bull"], "--")]:
+                ax6.axhline(level, color=col, lw=0.7, ls=ls)
+            if div_df is not None:
+                div_tipos = align_series(div_df["divergencia_tipo"], idx)
+                div_rsi_v = align_series(RSIIndicator(close=close, window=14).rsi(), idx)
+                for xi_d, (dt, rv) in enumerate(zip(div_tipos, div_rsi_v)):
+                    if dt == "alcista":
+                        ax6.annotate("▲", xy=(xi_d, rv), fontsize=8, color=STYLE["bull"],
+                                     ha="center", va="top", xytext=(0, -8), textcoords="offset points")
+                    elif dt == "bajista":
+                        ax6.annotate("▼", xy=(xi_d, rv), fontsize=8, color=STYLE["bear"],
+                                     ha="center", va="bottom", xytext=(0, 8), textcoords="offset points")
+            ax6.set_ylim(0, 100)
+            ax6.yaxis.set_ticks([30, 50, 70])
+            panel_style(ax6, ylabel="RSI", yticks=3)
+            format_xaxis(ax6, idx)
+            ax6.tick_params(labelbottom=True)
+            ax6.set_title("RSI  14  ·  ▲ div alcista  ▼ div bajista",
+                          fontsize=9, color=STYLE["muted"], loc="right", pad=4)
 
-    # Recuadro informativo
-    _mcg_val  = mcg25.iloc[-1]
-    _e200_val = ema200.iloc[-1]
-    _precio   = close.iloc[-1]
-    _rsi_val  = rsi_s.iloc[-1]
-    _azul_verde  = konc["azul"].iloc[-1] > 0
-    _area_max    = konc[["verde", "marron", "azul"]].max(axis=1)
-    _area_min    = konc[["verde", "marron", "azul"]].min(axis=1)
-    _media_val   = konc["media"].iloc[-1]
-    _punto_verde = (not pd.isna(_media_val) and
-                    _area_min.iloc[-1] <= _media_val <= _area_max.iloc[-1])
-    _ak = "🟢" if _azul_verde  else "🔴"
-    _pk = "🟢" if _punto_verde else "🔴"
-    _pvi_str = "🟢 PVI>" if pvi_s.iloc[-1] > pvi_ema.iloc[-1] else "🔴 PVI<"
-    if bitman is not None and not bitman.empty:
-        _b_etiq  = bitman["Bitman_Etiqueta"].iloc[-1]
-        _b_velas = int(bitman["Bitman_Velas"].iloc[-1])
-        _b_emoji = ("📈" if _b_etiq in ("IMPULSO ALCISTA", "RETROCESO ALCISTA")
-                    else ("📉" if "BAJISTA" in _b_etiq else "⬜"))
-        _bitman_str = f"{_b_etiq} ({_b_velas}v) {_b_emoji}"
-    else:
-        _bitman_str = "N/D"
-    if div_df is not None:
-        _hits = div_df[div_df["divergencia_tipo"] != "ninguna"]
-        if not _hits.empty:
-            _dlast  = _hits.iloc[-1]["divergencia_tipo"]
-            _didx   = div_df.index.get_loc(_hits.index[-1])
-            _dvelas = len(div_df) - 1 - _didx
-            _de     = "🟢" if _dlast == "alcista" else "🔴"
-            if _dvelas <= 5:    _div_str = f"{_de} {_dlast.upper()} FRESCA ({_dvelas}v)"
-            elif _dvelas <= 20: _div_str = f"{_de} {_dlast.upper()} válida ({_dvelas}v)"
-            elif _dvelas <= 50: _div_str = f"{'🟡' if _dlast=='alcista' else '🟠'} {_dlast.upper()} contexto ({_dvelas}v)"
-            else:               _div_str = f"⚪ {_dlast} caducada ({_dvelas}v)"
-        else:
-            _div_str = "⚪ sin divergencia"
-    else:
-        _div_str = "⚪"
-    _bbwp_val = bbwp_s.dropna().iloc[-1] if len(bbwp_s.dropna()) > 0 else np.nan
-    if not np.isnan(_bbwp_val):
-        _bbwp_punto   = "🟢" if _bbwp_val < 20 else ("🔴" if _bbwp_val > 80 else "⚪")
-        _bbwp_box_str = f"{_bbwp_punto} {_bbwp_val:.1f}%  (13/252)"
-    else:
-        _bbwp_box_str = "⚪ n/d"
-    _mcg_sym  = "🟡" if abs(_precio / _mcg_val  - 1) < 0.012 else ("🟢" if _precio > _mcg_val  else "🔴")
-    _e200_sym = "🟡" if abs(_precio / _e200_val - 1) < 0.015 else ("🟢" if _precio > _e200_val else "🔴")
-    _lines = [
-        f"Tendencia  MCG25:{_mcg_sym}  EMA200:{_e200_sym}   RSI:{_rsi_val:.1f}",
-        f"Koncorde   Azul:{_ak}  Punto:{_pk}",
-        f"PVI        {_pvi_str} EMA25",
-        f"BBWP       {_bbwp_box_str}",
-        f"Bitman     {_bitman_str}",
-        f"Div RSI    {_div_str}",
-        f"SCORE      {score_label}  ·  {bull_n}/{total_n}  ({pct}%)",
-    ]
-    _box_x, _box_y = 0.07, 0.870
-    _box_h         = 0.095
-    _box_w         = 0.27
-    _box_ax = fig.add_axes([_box_x, _box_y - _box_h, _box_w, _box_h], frameon=True)
-    _box_ax.set_facecolor(STYLE["panel"])
-    for spine in _box_ax.spines.values():
-        spine.set_edgecolor(STYLE["border"])
-        spine.set_linewidth(0.8)
-    _box_ax.set_xticks([]); _box_ax.set_yticks([])
-    for li, line in enumerate(_lines):
-        _col = score_color if li == 6 else STYLE["text"]
-        _box_ax.text(0.03, 0.94 - li * 0.135, line,
-                     transform=_box_ax.transAxes,
-                     fontsize=7, color=_col, va="top", family="monospace")
+            for ax in axes:
+                ax.set_xlim(-1, len(idx))
 
-    # Barra de señales
-    sig_y = 0.01; sig_h = 0.016; x0 = 0.07
-    gap_w = (0.97 - x0) / len(sigs)
-    for i, s in enumerate(sigs):
-        col = (STYLE["bull"] if s["state"] == "bull" else
-               STYLE["bear"] if s["state"] == "bear" else STYLE["muted"])
-        xi  = x0 + i * gap_w
-        fig.text(xi + (gap_w - 0.003) / 2, sig_y + sig_h / 2,
-                 s["label"], fontsize=7.5, color=col,
-                 ha="center", va="center",
-                 bbox=dict(boxstyle="round,pad=0.3", facecolor=STYLE["panel"],
-                           edgecolor=col + "66", linewidth=0.8))
+            # Recuadro informativo
+            _mcg_val  = mcg25.iloc[-1]
+            _e200_val = ema200.iloc[-1]
+            _precio   = close.iloc[-1]
+            _rsi_val  = rsi_s.iloc[-1]
+            _azul_verde  = konc["azul"].iloc[-1] > 0
+            _area_max    = konc[["verde", "marron", "azul"]].max(axis=1)
+            _area_min    = konc[["verde", "marron", "azul"]].min(axis=1)
+            _media_val   = konc["media"].iloc[-1]
+            _punto_verde = (not pd.isna(_media_val) and
+                            _area_min.iloc[-1] <= _media_val <= _area_max.iloc[-1])
+            _ak = "🟢" if _azul_verde  else "🔴"
+            _pk = "🟢" if _punto_verde else "🔴"
+            _pvi_str = "🟢 PVI>" if pvi_s.iloc[-1] > pvi_ema.iloc[-1] else "🔴 PVI<"
+            if bitman is not None and not bitman.empty:
+                _b_etiq  = bitman["Bitman_Etiqueta"].iloc[-1]
+                _b_velas = int(bitman["Bitman_Velas"].iloc[-1])
+                _b_emoji = ("📈" if _b_etiq in ("IMPULSO ALCISTA", "RETROCESO ALCISTA")
+                            else ("📉" if "BAJISTA" in _b_etiq else "⬜"))
+                _bitman_str = f"{_b_etiq} ({_b_velas}v) {_b_emoji}"
+            else:
+                _bitman_str = "N/D"
+            if div_df is not None:
+                _hits = div_df[div_df["divergencia_tipo"] != "ninguna"]
+                if not _hits.empty:
+                    _dlast  = _hits.iloc[-1]["divergencia_tipo"]
+                    _didx   = div_df.index.get_loc(_hits.index[-1])
+                    _dvelas = len(div_df) - 1 - _didx
+                    _de     = "🟢" if _dlast == "alcista" else "🔴"
+                    if _dvelas <= 5:    _div_str = f"{_de} {_dlast.upper()} FRESCA ({_dvelas}v)"
+                    elif _dvelas <= 20: _div_str = f"{_de} {_dlast.upper()} válida ({_dvelas}v)"
+                    elif _dvelas <= 50: _div_str = f"{'🟡' if _dlast=='alcista' else '🟠'} {_dlast.upper()} contexto ({_dvelas}v)"
+                    else:               _div_str = f"⚪ {_dlast} caducada ({_dvelas}v)"
+                else:
+                    _div_str = "⚪ sin divergencia"
+            else:
+                _div_str = "⚪"
+            _bbwp_val = bbwp_s.dropna().iloc[-1] if len(bbwp_s.dropna()) > 0 else np.nan
+            if not np.isnan(_bbwp_val):
+                _bbwp_punto   = "🟢" if _bbwp_val < 20 else ("🔴" if _bbwp_val > 80 else "⚪")
+                _bbwp_box_str = f"{_bbwp_punto} {_bbwp_val:.1f}%  (13/252)"
+            else:
+                _bbwp_box_str = "⚪ n/d"
+            _mcg_sym  = "🟡" if abs(_precio / _mcg_val  - 1) < 0.012 else ("🟢" if _precio > _mcg_val  else "🔴")
+            _e200_sym = "🟡" if abs(_precio / _e200_val - 1) < 0.015 else ("🟢" if _precio > _e200_val else "🔴")
+            _lines = [
+                f"Tendencia  MCG25:{_mcg_sym}  EMA200:{_e200_sym}   RSI:{_rsi_val:.1f}",
+                f"Koncorde   Azul:{_ak}  Punto:{_pk}",
+                f"PVI        {_pvi_str} EMA25",
+                f"BBWP       {_bbwp_box_str}",
+                f"Bitman     {_bitman_str}",
+                f"Div RSI    {_div_str}",
+                f"SCORE      {score_label}  ·  {bull_n}/{total_n}  ({pct}%)",
+            ]
+            _box_x, _box_y = 0.07, 0.870
+            _box_h         = 0.095
+            _box_w         = 0.27
+            _box_ax = fig.add_axes([_box_x, _box_y - _box_h, _box_w, _box_h], frameon=True)
+            _box_ax.set_facecolor(STYLE["panel"])
+            for spine in _box_ax.spines.values():
+                spine.set_edgecolor(STYLE["border"])
+                spine.set_linewidth(0.8)
+            _box_ax.set_xticks([]); _box_ax.set_yticks([])
+            for li, line in enumerate(_lines):
+                _col = score_color if li == 6 else STYLE["text"]
+                _box_ax.text(0.03, 0.94 - li * 0.135, line,
+                             transform=_box_ax.transAxes,
+                             fontsize=7, color=_col, va="top", family="monospace")
 
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=150, bbox_inches="tight", facecolor=STYLE["bg"])
-    plt.close("all")  # libera memoria — crítico en GitHub Actions
-    buf.seek(0)
-    b64 = base64.b64encode(buf.read()).decode("utf-8")
-    buf.close()
-    return b64, None
+            # Barra de señales
+            sig_y = 0.01; sig_h = 0.016; x0 = 0.07
+            gap_w = (0.97 - x0) / len(sigs)
+            for i, s in enumerate(sigs):
+                col = (STYLE["bull"] if s["state"] == "bull" else
+                       STYLE["bear"] if s["state"] == "bear" else STYLE["muted"])
+                xi  = x0 + i * gap_w
+                fig.text(xi + (gap_w - 0.003) / 2, sig_y + sig_h / 2,
+                         s["label"], fontsize=7.5, color=col,
+                         ha="center", va="center",
+                         bbox=dict(boxstyle="round,pad=0.3", facecolor=STYLE["panel"],
+                                   edgecolor=col + "66", linewidth=0.8))
+
+            # FIX CLAVE — guardar con backend explícito y sin bbox_inches="tight"
+            # bbox_inches="tight" invoca _get_renderer internamente y en entornos
+            # headless multihilo puede dejar escapar la excepción Done.
+            # Usamos fig.canvas.draw() previo + savefig sin tight para evitarlo.
+            fig.canvas.draw()                        # fuerza render limpio
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=150,  # <-- sin bbox_inches="tight"
+                        facecolor=STYLE["bg"], backend="agg")
+            buf.seek(0)
+            b64 = base64.b64encode(buf.read()).decode("utf-8")
+            buf.close()
+            return b64, None
+
+        except Exception as e:
+            return None, str(e)
+
+        finally:
+            # FIX CRÍTICO — siempre cerrar la figura específica, nunca "all"
+            # plt.close("all") en un entorno multihilo podría cerrar figuras
+            # que otro hilo está usando. plt.close(fig) cierra SÓLO ésta.
+            if fig is not None:
+                plt.close(fig)
 
 
 # ============================================================
@@ -1308,11 +1356,9 @@ tr:hover td{{background:rgba(255,255,255,.03)}}
 .ticker{{font-weight:900;font-size:14px;cursor:pointer;color:#60a5fa}}
 .ticker:hover{{text-decoration:underline}}
 .razones{{font-size:10px;color:var(--muted);margin-top:3px;max-width:600px}}
-/* Señal colors */
 .s0{{color:#efb030}}.s1{{color:var(--bull)}}.s2{{color:#a3e635}}
 .s3{{color:#60a5fa}}.s4{{color:#f59e0b}}.s5{{color:#fb923c}}
 .s6{{color:var(--bear)}}.s7{{color:var(--muted)}}.s8{{color:var(--bear)}}
-/* Graficador */
 .g-search-wrap{{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}}
 #g-input{{font-size:15px;font-weight:900;padding:9px 12px;border-radius:8px;
   background:var(--panel2);border:1px solid var(--border);color:var(--text);
@@ -1336,7 +1382,6 @@ tr:hover td{{background:rgba(255,255,255,.03)}}
     <button class="tab-btn" onclick="switchTab('graficador',this)">📈 Graficador</button>
   </div>
 
-  <!-- DASHBOARD -->
   <div id="tab-dashboard" class="tab-pane active">
     <div class="card">
       <div class="filters">
@@ -1361,7 +1406,6 @@ tr:hover td{{background:rgba(255,255,255,.03)}}
     </div>
   </div>
 
-  <!-- GRAFICADOR -->
   <div id="tab-graficador" class="tab-pane">
     <div class="card">
       <div class="g-search-wrap">
@@ -1404,7 +1448,6 @@ function señalClass(s) {{
 }}
 
 function init() {{
-  var n = ROWS.filter(r => r.señal).length;
   document.getElementById('subtitle').textContent =
     'Última actualización: ' + (ROWS[0] && ROWS[0].generated_at ? ROWS[0].generated_at : '—') +
     ' · ' + ROWS.length + ' activos analizados';
@@ -1546,15 +1589,19 @@ def main():
     results.sort(key=lambda x: (ORDEN_SEÑAL.get(x.get("señal", ""), 9), x["ticker"]))
 
     # ── Graficador: generar PNG por ticker ─────────────────────
+    # FIX — max_workers=1 para gráficos: el lock ya serializa matplotlib,
+    # pero un solo hilo evita además la presión de RAM en GitHub Actions
+    # (cada figura ocupa ~150-200 MB en DPI 150 con 7 paneles).
     print("Generando gráficos...")
     ok_tickers = [r["ticker"] for r in results]
-    # max_workers=2 para evitar picos de RAM en GitHub Actions
-    with ThreadPoolExecutor(max_workers=2) as ex:
+
+    with ThreadPoolExecutor(max_workers=1) as ex:
         def gen_chart(t):
             b64, err = render_chart(t)
             fname = t.replace("=", "").replace("-", "_")
             if b64:
                 (charts_dir / f"{fname}.b64").write_text(b64, encoding="utf-8")
+                print(f"  📊 {t}")
                 return True
             else:
                 print(f"  ⚠ gráfico {t}: {err}")
