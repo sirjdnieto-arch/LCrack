@@ -1311,7 +1311,7 @@ ORDEN_SEÑAL = {
     "🟡 COMPRA 50%":         2,
     "👀 VIGILAR":            3,
     "⏰ LLEGAS TARDE":       4,
-    "⚠️ VIGILAR SALIDA":    5,
+    "⚠️ VIGILAR SALIDA":     5,
     "🔴 VENTA":              6,
     "⛔ SIN SETUP":          7,
     "⛔ NI DE COÑA":         8,
@@ -1424,7 +1424,7 @@ tr:hover td{{background:rgba(255,255,255,.03)}}
 
 <script>
 var ROWS = [];
-var ORDEN = {orden_js};
+const ORDEN = {orden_js};
 
 fetch('./data.json')
   .then(r => r.json())
@@ -1553,81 +1553,3 @@ init();
 </body>
 </html>
 """
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-    print("LCrack Sovereign — iniciando")
-    site_dir   = Path("site")
-    data_dir   = site_dir / "data"
-    charts_dir = data_dir / "charts"
-    site_dir.mkdir(exist_ok=True)
-    data_dir.mkdir(parents=True, exist_ok=True)
-    charts_dir.mkdir(parents=True, exist_ok=True)
-
-    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    # ── Dashboard: analizar todos los tickers en paralelo ──────
-    print(f"Analizando {len(TICKERS)} tickers...")
-    results = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(analyze_ticker, t): t for t in TICKERS}
-        for fut in as_completed(futures):
-            t = futures[fut]
-            try:
-                r = fut.result()
-                if r:
-                    r["generated_at"] = generated_at
-                    results.append(r)
-                    print(f"  ✓ {t:14s} {r['señal']}")
-            except Exception as e:
-                print(f"  ❌ {t}: {e}")
-
-    results.sort(key=lambda x: (ORDEN_SEÑAL.get(x.get("señal", ""), 9), x["ticker"]))
-
-    # ── Graficador: generar PNG por ticker ─────────────────────
-    # FIX — max_workers=1 para gráficos: el lock ya serializa matplotlib,
-    # pero un solo hilo evita además la presión de RAM en GitHub Actions
-    # (cada figura ocupa ~150-200 MB en DPI 150 con 7 paneles).
-    print("Generando gráficos...")
-    ok_tickers = [r["ticker"] for r in results]
-
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        def gen_chart(t):
-            b64, err = render_chart(t)
-            fname = t.replace("=", "").replace("-", "_")
-            if b64:
-                (charts_dir / f"{fname}.b64").write_text(b64, encoding="utf-8")
-                print(f"  📊 {t}")
-                return True
-            else:
-                print(f"  ⚠ gráfico {t}: {err}")
-                return False
-
-        futures_c = {ex.submit(gen_chart, t): t for t in ok_tickers}
-        n_charts = sum(1 for fut in as_completed(futures_c) if fut.result())
-
-    print(f"  {n_charts}/{len(ok_tickers)} gráficos generados")
-
-    # ── Escribir data.json ─────────────────────────────────────
-    data_json_path = site_dir / "data.json"
-    data_json_path.write_text(
-        json.dumps(results, ensure_ascii=True, indent=2), encoding="utf-8"
-    )
-    print(f"✅ data.json → {data_json_path} ({len(results)} tickers)")
-
-    # ── Escribir index.html ────────────────────────────────────
-    html_path = site_dir / "index.html"
-    html_path.write_text(build_html(), encoding="utf-8")
-    print(f"✅ index.html → {html_path}")
-    print(f"\n🏁 Estructura generada:")
-    print(f"   site/index.html")
-    print(f"   site/data.json           ({len(results)} tickers)")
-    print(f"   site/data/charts/*.b64   ({len(list(charts_dir.glob('*.b64')))} gráficos)")
-
-
-if __name__ == "__main__":
-    main()
